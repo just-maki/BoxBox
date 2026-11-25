@@ -30,6 +30,7 @@ import os
 import signal
 import socket
 import struct
+import subprocess
 import sys
 import time
 from array import array
@@ -514,6 +515,12 @@ def main() -> int:
     ap.add_argument("--out", default=None, help="JSONL output path")
     ap.add_argument("--duration", type=float, default=None, help="stop after N seconds")
     ap.add_argument(
+        "--live",
+        action="store_true",
+        help="open live_view.py in a second window (needs --out). The view is a "
+        "separate process so it cannot add jitter to the receive loop.",
+    )
+    ap.add_argument(
         "--replay",
         default=None,
         metavar="JSONL",
@@ -523,6 +530,9 @@ def main() -> int:
 
     if args.replay:
         return replay(args.replay)
+    if args.live and not args.out:
+        print("--live needs --out: the live view reads the file the capture writes.", file=sys.stderr)
+        return 2
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -555,6 +565,16 @@ def main() -> int:
     print(f"Receive clock: {clk.implementation}, resolution {clk.resolution * 1e6:g} us")
     if args.out:
         print(f"Writing {args.out}")
+    if args.live:
+        viewer = os.path.join(os.path.dirname(os.path.abspath(__file__)), "live_view.py")
+        if os.name == "nt":
+            subprocess.Popen(
+                [sys.executable, viewer, args.out],
+                creationflags=subprocess.CREATE_NEW_CONSOLE,
+            )
+            print("Live view opened in a second window.")
+        else:
+            print(f"Live view: run   python {viewer} {args.out}   in another terminal")
     print("Drive a timed lap. Ctrl+C to stop.\n")
 
     try:

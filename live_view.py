@@ -42,8 +42,8 @@ FROZEN_S = 0.5  # game clock flat over this much receive time -> "STOPPED"
 
 def build(rows: deque) -> ch.HeaderCapture:
     cap = ch.HeaderCapture(None)
-    for t, pid, uid, st, fr in rows:
-        cap.record(pid, uid, st, fr, t)
+    for t, pid, uid, st, ofr in rows:
+        cap.record(pid, uid, st, ofr, t)
     return cap
 
 
@@ -81,29 +81,31 @@ def render(path: str, rows: deque, window: float, totals: dict, stale: float) ->
     out.append("")
     out.append(
         f"{'packet':<22}{'Hz':>7}{'p50':>8}{'p95':>8}{'max':>8}"
-        f"{'skips':>7}{'lost':>6}{'excl':>6}"
+        f"{'lost':>6}{'absent':>8}{'excl':>6}"
     )
-    out.append("-" * 72)
+    out.append("-" * 73)
+    fl = ch.frame_loss(cap)
     for pid in sorted(cap.counts):
         name = ch.PACKET_NAMES.get(pid, f"Unknown{pid}")
         gaps, excluded = ch.gap_stats(cap, pid, disc_after)
         active = sum(gaps) / 1000.0
         rate = len(gaps) / active if active > 0 else 0.0
-        skips = lost = ""
-        if pid in ch.RATE_DRIVEN:
-            r = ch.loss_stats(cap, pid, disc_after)
-            skips = str(r["skipped_frames"])
-            lost = "?" if r["lost"] is None else str(r["lost"])
+        r = fl["types"].get(pid)
+        lost = str(r["lost"]) if r else ""
+        absent = str(r["absent"]) if r else ""
         out.append(
             f"{name + ' (' + str(pid) + ')':<22}{rate:>7.2f}"
             f"{ch.pct(gaps, 0.50):>8.1f}{ch.pct(gaps, 0.95):>8.1f}"
             f"{(gaps[-1] if gaps else float('nan')):>8.1f}"
-            f"{skips:>7}{lost:>6}{excluded:>6}"
+            f"{lost:>6}{absent:>8}{excluded:>6}"
         )
     out += [
         "",
-        "gaps in ms on the receive clock. skips = missing frame numbers; lost = skips",
-        "the game clock confirms as drops ('?' = too few samples in window to judge).",
+        f"frames checked: {fl['checked']}   frame numbers with no rate-driven packet: "
+        f"{fl['whole_missing']} (not counted as loss)",
+        "",
+        "gaps in ms on the receive clock. lost = missing from a frame in which other",
+        "rate-driven types arrived. absent = type not sent for a stretch.",
         "Newest ~1 s is provisional. Final figures: the report printed when capture ends.",
         "Ctrl+C to close this window. It does not stop the capture.",
     ]
@@ -150,7 +152,7 @@ def main() -> int:
                         continue
                     try:
                         r = json.loads(line)
-                        row = (r["t_mono"], r["packet_id"], r["session_uid"], r["session_time"], r["frame_id"])
+                        row = (r["t_mono"], r["packet_id"], r["session_uid"], r["session_time"], r["overall_frame_id"])
                     except (ValueError, KeyError):
                         totals["bad"] += 1
                         continue

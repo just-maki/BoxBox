@@ -78,14 +78,19 @@ restart or new session shifts it for good. These game-clock breaks are detected 
 one-sided minimum filter, listed in the report, and gaps that span one are left out of the
 statistics.
 
-**A frame-number skip is not automatically loss.** The game sometimes advances its frame
-counter without sending a packet. A skip counts as a lost packet only when the game clock
-also shows a missing interval, meaning the interval across the skip looks like two normal
-intervals. The threshold is derived from each capture's own data. The report also gives
-the upper bound that treats every skip as a drop.
+**Loss is detected from partial frames, not frame-number gaps.** The game's `frame_id`
+counts its own frames. When the game's frame rate is above the send rate, the counter
+skips numbers the game never sent, so a gap in the sequence isn't evidence of loss. The
+spec guarantees that the rate-driven packets for a frame are sent together. So a frame
+where some of those packet types arrived and others didn't can only mean the missing ones
+were lost in transport. Only those are counted. A type missing for several frames in a
+row while the others arrive is reported as *absent*, meaning the game wasn't sending it.
+For example, Motion is only sent while the player is in control.
 
-**Loss includes this machine.** Anything the OS drops under receive-buffer pressure counts
-as loss. This is a limitation of the method, and reports state it.
+**The blind spot is stated, not hidden.** A whole frame's packets lost together, such as
+in a receive-buffer overflow, look the same in the headers as a frame the game never sent.
+These frames are reported in every run but not counted as loss, and reports state this
+limitation.
 
 **The live view can't affect the measurement.** The capture loop is the thing being
 measured, so the live view is a separate process that reads the capture file. It uses the

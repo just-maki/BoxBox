@@ -89,10 +89,10 @@ PACKET_NAMES = {
     16: "CarTelemetry2",  # new in the 2026 format
 }
 
-# Packet types that follow the configured send rate, one per frame. Frame-counter
-# gaps mean dropped packets ONLY for these. Others are event-driven or fixed-rate
-# (Session ~2/s, CarDamage 10/s, SessionHistory cycles through cars), so a gap in
-# their frame counter is normal and says nothing about loss.
+# Packet types that follow the configured send rate. The game sends all of them
+# together on each send frame, which is what partial-frame loss detection relies
+# on (see LOSS_MAX_RUN). Others are event-driven or fixed-rate (Session 2/s,
+# CarDamage 10/s, SessionHistory cycles through cars) and are not checked.
 RATE_DRIVEN = {0, 2, 6, 7, 13, 16}
 
 # Kernel receive buffer. Too small and the OS silently drops packets when this
@@ -120,18 +120,36 @@ RCVBUF_BYTES = 8 * 1024 * 1024
 DISC_WINDOW_S = 1.0
 DISC_THRESHOLD_S = 0.05
 
-# A frame-number skip counts as a lost packet only when the game-clock interval
-# across it looks like a real drop. A dropped packet makes that interval the sum
-# of two consecutive normal intervals, so the threshold is a low percentile of
-# that two-interval distribution, measured from the same capture for the same
-# packet type. Below it, the game advanced frame_id without sending.
+# Loss detection: partial frames.
 #
-# First real capture (Motion, 60 Hz setting, ~535 s): one interval p50 16.1 ms;
-# two intervals p1 26.1 ms; all 319 skips 16.3-24.9 ms. No overlap, so every
-# skip was game-side and loss was 0. Cost of the rule: ~1% of real drops (those
-# whose two intervals sum below p1) would be called skips.
-LOSS_TWO_INTERVAL_PCTL = 0.01
-MIN_NORMAL_STEPS = 100
+# The spec says rate-driven packets sent on a frame "will all get sent together
+# and will never be separated across frames". So a frame that arrived for some
+# rate-driven types but not others means the missing ones were lost in
+# transport. That is CONFIRMED loss, and it does not depend on how fast the
+# game's frame counter runs.
+#
+# Frame-number skips are NOT evidence of loss. frame_id counts the game's own
+# frames; when the game's frame rate exceeds the send rate, the counter skips
+# numbers the game never sent. (Second 60 Hz capture: counter at 61-64 per
+# game-second, packets at 59.4 -- 4,381 skips, every one a whole frame, none
+# partial.) An earlier version classified skips by the game-clock interval
+# across them; it reported 4.5% false loss on that capture and was removed.
+#
+# A whole burst lost in transport looks identical to an unsent frame in the
+# headers, so whole missing frames are reported but not counted as loss. That
+# is this method's blind spot, and it covers receive-buffer overflow, which
+# would tend to drop whole bursts.
+#
+# Frames are keyed by (session_uid, overall_frame_id): the overall counter does
+# not go back after flashbacks. The first and last frame of each session in the
+# data are skipped, because starting or stopping a capture -- or the edge of a
+# live-view window -- can cut a burst in half.
+#
+# A type missing for more than LOSS_MAX_RUN frames in a row while the others
+# arrive is reported as "absent", not lost: Motion, for one, is only sent while
+# the player is in control. Transport drops are independent per packet, so a
+# long single-type run is not what loss looks like.
+LOSS_MAX_RUN = 2
 
 
 class HeaderCapture:
@@ -156,14 +174,19 @@ class HeaderCapture:
         self.counts: dict[int, int] = defaultdict(int)
         self.t: dict[int, array] = defaultdict(lambda: array("d"))
         self.st: dict[int, array] = defaultdict(lambda: array("d"))
-        self.fr: dict[int, array] = defaultdict(lambda: array("q"))
+        self.ofr: dict[int, array] = defaultdict(lambda: array("q"))  # overall_frame_id
         self.uid: dict[int, array] = defaultdict(lambda: array("Q"))
 
         self.t_start = time.perf_counter()
         self.elapsed: float | None = None  # set by replay; live uses the clock
 
     def record(
-        self, packet_id: int, session_uid: int, session_time: float, frame_id: int, t_rel: float
+        self,
+        packet_id: int,
+        session_uid: int,
+        session_time: float,
+        overall_frame_id: int,
+        t_rel: float,
     ) -> None:
         self.counts[packet_id] += 1
         self.g_t.append(t_rel)
@@ -171,7 +194,7 @@ class HeaderCapture:
         self.g_uid.append(session_uid)
         self.t[packet_id].append(t_rel)
         self.st[packet_id].append(session_time)
-        self.fr[packet_id].append(frame_id)
+        self.ofr[packet_id].append(overall_frame_id)
         self.uid[packet_id].append(session_uid)
 
     def feed(self, data: bytes, t_recv: float, t_wall: float) -> None:
@@ -209,7 +232,7 @@ class HeaderCapture:
         ) = layout.unpack_from(data, 0)
 
         t_rel = t_recv - self.t_start
-        self.record(packet_id, session_uid, session_time, frame_id, t_rel)
+        self.record(packet_id, session_uid, session_time, overall_frame_id, t_rel)
 
         if self.out:
             self.out.write(
@@ -320,47 +343,61 @@ def gap_stats(cap: HeaderCapture, pid: int, disc_after: list[float]) -> tuple[li
     return gaps, excluded
 
 
-def loss_stats(cap: HeaderCapture, pid: int, disc_after: list[float]) -> dict:
+def frame_loss(cap: HeaderCapture) -> dict:
     """
-    Classify frame-number skips for one rate-driven packet type as lost packets
-    or game-side skips, using the game clock across each skip.
+    Partial-frame loss across all rate-driven packet types. See the comment at
+    LOSS_MAX_RUN for the method and its blind spot.
+
+    Returns {"checked": frames checked, "whole_missing": frame numbers with no
+    rate-driven packet, "frame_range": frame numbers spanned,
+    "types": {pid: {"n", "lost", "absent", "backwards"}}}.
     """
-    t, st, fr, uid = cap.t[pid], cap.st[pid], cap.fr[pid], cap.uid[pid]
-    # (frame step, game-clock interval) per consecutive pair; None if the pair
-    # spans a new session or a game-clock discontinuity
-    steps = [
-        (fr[i + 1] - fr[i], st[i + 1] - st[i])
-        if uid[i + 1] == uid[i] and not crosses(disc_after, t[i], t[i + 1])
-        else None
-        for i in range(len(t) - 1)
-    ]
-    pairs = [p for p in steps if p is not None]
+    rd = sorted(pid for pid in cap.counts if pid in RATE_DRIVEN)
+    have = {pid: set(zip(cap.uid[pid], cap.ofr[pid])) for pid in rd}
+    frames = sorted(set().union(*have.values())) if rd else []
 
-    def normal_step(p) -> bool:
-        return p is not None and p[0] == 1 and p[1] > 0
+    # whole frames missing, per session; and each session's edge frames
+    whole_missing = frame_range = 0
+    edges = set()
+    for i, (uid, f) in enumerate(frames):
+        first = i == 0 or frames[i - 1][0] != uid
+        last = i == len(frames) - 1 or frames[i + 1][0] != uid
+        if first:
+            edges.add((uid, f))
+            start = f
+        else:
+            whole_missing += f - frames[i - 1][1] - 1
+        if last:
+            edges.add((uid, f))
+            frame_range += f - start + 1
+    checked = [k for k in frames if k not in edges]
 
-    one = sorted(p[1] for p in pairs if normal_step(p))
-    two = sorted(
-        a[1] + b[1] for a, b in zip(steps, steps[1:]) if normal_step(a) and normal_step(b)
-    )
-    res = {
-        "n": cap.counts[pid],
-        "skipped_frames": sum(s - 1 for s, _ in pairs if s >= 2),
-        "backwards": sum(1 for s, _ in pairs if s <= 0),
-        "lost": None,
-        "median_ms": None,
-        "threshold_ms": None,
+    types = {}
+    for pid in rd:
+        lost = absent = run = 0
+        prev_uid = None
+        for uid, f in checked + [(None, 0)]:  # sentinel flushes the last run
+            if uid != prev_uid or (uid, f) in have[pid]:
+                if run <= LOSS_MAX_RUN:
+                    lost += run
+                else:
+                    absent += run
+                run = 0
+            if uid is not None and (uid, f) not in have[pid]:
+                run += 1
+            prev_uid = uid
+        ofr, uids = cap.ofr[pid], cap.uid[pid]
+        backwards = sum(
+            1 for i in range(len(ofr) - 1) if uids[i + 1] == uids[i] and ofr[i + 1] < ofr[i]
+        )
+        types[pid] = {"n": cap.counts[pid], "lost": lost, "absent": absent, "backwards": backwards}
+
+    return {
+        "checked": len(checked),
+        "whole_missing": whole_missing,
+        "frame_range": frame_range,
+        "types": types,
     }
-    if len(two) < MIN_NORMAL_STEPS:
-        return res  # not enough normal steps to set a threshold
-    med = pct(one, 0.5)
-    thr = pct(two, LOSS_TWO_INTERVAL_PCTL)
-    lost = 0
-    for s, d in pairs:
-        if s >= 2 and d >= thr:
-            lost += min(s - 1, max(1, round(d / med) - 1))
-    res.update(lost=lost, median_ms=med * 1000, threshold_ms=thr * 1000)
-    return res
 
 
 def report(cap: HeaderCapture) -> None:
@@ -408,7 +445,7 @@ def report(cap: HeaderCapture) -> None:
 
     print(
         f"\nGame-clock discontinuities: {len(disc)} breaks in {len(episodes)} episode(s).\n"
-        "Gaps and frame steps spanning a break are excluded from every figure below."
+        "Gaps spanning a break are excluded from the gap figures below."
     )
     for start, end, count, off_b, off_a, reasons in episodes[:12]:
         print(
@@ -444,44 +481,37 @@ def report(cap: HeaderCapture) -> None:
         "spanning a game-clock discontinuity. Hz and active s use the remaining gaps."
     )
 
-    rd = [pid for pid in sorted(cap.counts) if pid in RATE_DRIVEN]
-    print("\nLoss (rate-driven packet types only):")
-    if not rd:
-        print("  none seen -- drive a timed lap to get Motion / LapData / CarTelemetry")
+    if not any(pid in RATE_DRIVEN for pid in cap.counts):
+        print("\nLoss: no rate-driven packets -- drive a timed lap to get Motion / LapData")
         return
 
-    print(
-        f"  {'packet':<16}{'n':>8}{'lost':>7}{'loss %':>9}"
-        f"{'skips':>8}{'upper %':>9}{'backwd':>8}{'thresh ms':>11}"
-    )
-    for pid in rd:
+    fl = frame_loss(cap)
+    checked = fl["checked"]
+    print(f"\nLoss, rate-driven packet types. {checked} frames checked (frames carrying")
+    print("at least one rate-driven packet, minus each session's first and last).")
+    print(f"  {'packet':<16}{'n':>8}{'lost':>7}{'loss %':>9}{'absent':>8}{'backwd':>8}")
+    for pid, r in fl["types"].items():
         name = PACKET_NAMES.get(pid, f"Unknown{pid}")
-        r = loss_stats(cap, pid, disc_after)
-        n, skips = r["n"], r["skipped_frames"]
-        upper = skips / (n + skips) * 100 if n + skips else 0.0
-        if r["lost"] is None:
-            lost_s, pct_s, thr_s = "?", "?", "n/a"
-        else:
-            lost_s = str(r["lost"])
-            pct_s = f"{r['lost'] / (n + r['lost']) * 100:.3f}"
-            thr_s = f"{r['threshold_ms']:.1f}"
+        loss_pct = r["lost"] / checked * 100 if checked else float("nan")
         print(
-            f"  {name:<16}{n:>8}{lost_s:>7}{pct_s:>9}"
-            f"{skips:>8}{upper:>9.3f}{r['backwards']:>8}{thr_s:>11}"
+            f"  {name:<16}{r['n']:>8}{r['lost']:>7}{loss_pct:>9.3f}"
+            f"{r['absent']:>8}{r['backwards']:>8}"
         )
 
+    whole, rng = fl["whole_missing"], fl["frame_range"]
     print(
-        f"\n  skips    = frame numbers missing from the sequence.\n"
-        f"  lost     = skips where the game clock ALSO shows a missing interval: the\n"
-        f"             interval across the skip is at least thresh, the p{LOSS_TWO_INTERVAL_PCTL * 100:g} of\n"
-        f"             two consecutive normal intervals (what a real drop looks like).\n"
-        f"             The rest are the game advancing frame_id without sending.\n"
-        f"             By construction ~{LOSS_TWO_INTERVAL_PCTL * 100:g}% of real drops fall below thresh.\n"
-        f"  upper %  = loss if every skip were a real drop -- the bound, not the estimate.\n"
-        f"  backwd   = frame number went backwards without a clock discontinuity\n"
-        f"             (UDP reordering).\n"
-        f"  Loss includes anything the kernel dropped under buffer pressure, not just\n"
-        f"  the network. Note that in the report's limitations section."
+        f"\n  lost    = missing from a frame in which other rate-driven types arrived.\n"
+        f"            The game sends them as one burst, so only transport splits one.\n"
+        f"  absent  = missing for more than {LOSS_MAX_RUN} frames in a row while others arrived:\n"
+        f"            the game not sending that type (e.g. Motion outside player control).\n"
+        f"  backwd  = frame number went backwards in arrival order (UDP reordering).\n"
+        f"\n  Frame numbers with no rate-driven packet at all: {whole} of {rng}"
+        f" ({(whole / rng * 100) if rng else 0:.2f}%).\n"
+        f"  frame_id counts the game's frames, so when the game's frame rate exceeds the\n"
+        f"  send rate these are mostly frames it never sent. A whole burst lost in\n"
+        f"  transport -- including a receive-buffer overflow -- looks identical in the\n"
+        f"  headers, so these are NOT counted as loss. That is the method's blind spot;\n"
+        f"  state it in the report's limitations section."
     )
 
 
@@ -496,7 +526,9 @@ def replay(path: str) -> int:
             r = json.loads(line)
             cap.total += 1
             cap.formats_seen.add(r["packet_format"])
-            cap.record(r["packet_id"], r["session_uid"], r["session_time"], r["frame_id"], r["t_mono"])
+            cap.record(
+                r["packet_id"], r["session_uid"], r["session_time"], r["overall_frame_id"], r["t_mono"]
+            )
             last_t = r["t_mono"]
     cap.elapsed = last_t
     print(f"Replaying {path}")

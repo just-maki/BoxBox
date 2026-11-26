@@ -142,6 +142,28 @@ Measure from day one:
   higher send rates are known to increase loss. Sweep 10 / 20 / 30 / 60 Hz and report the
   curve. This is a finding, not a defect — and it is a naturally occurring fault, free.
 
+### 4.1 Live view of capture health
+
+`live_view.py` shows capture health while a session runs — per-packet-type rate, gap
+p50 / p95 / max, frame skips, confirmed drops, game-clock state — the role a quick-look
+monitor plays in flight test: knowing the test is producing good data before it ends.
+
+Rules, so the live view does not undermine what it reports:
+
+1. **Separate process.** It reads the capture's JSONL; it never runs inside the receive
+   loop, because that loop is what `REQ-CAP-001` measures.
+2. **Same functions as the end-of-run report**, on a sliding window, so live and final
+   figures agree by construction.
+3. **Only metrics already measured offline go live.** Lap timing goes live after phase 2
+   has its error distribution; anomaly alerts after phase 7 has P_d and false-alarm rate.
+   Not before.
+4. **Its own delay is a measured figure.** Currently it is bounded by the capture's 64 KiB
+   write buffer: ~0.5 s at the 60 Hz setting, ~2 s at 10 Hz. Packet-to-screen latency as a
+   distribution is not yet measured.
+
+Driver-facing feedback (delta to best lap, braking points) is out of scope: it is a
+sim-racing product, not a measurement rig.
+
 ---
 
 ## 5. Phase 2 — Lap timing and its reference
